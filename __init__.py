@@ -1,3 +1,8 @@
+"""
+BakingBakes Addon - Clean, Refactored Single File
+No more ugly elif chains or monolithic code!
+"""
+
 bl_info = {
     "name": "BakingBakes",
     "author": "Bob Tabbington",
@@ -11,8 +16,12 @@ bl_info = {
 }
 
 import bpy
-from bpy.props import CollectionProperty, PointerProperty, StringProperty
+from bpy.props import CollectionProperty, PointerProperty
 from bpy.types import Panel, PropertyGroup, UIList, Operator
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
 
 class BakeObjectItem(PropertyGroup):
     """Individual bake object item"""
@@ -30,6 +39,32 @@ class BakeObjectsList(PropertyGroup):
         name="Bake Selected Object to Target Objects",
         description="Bake the selected high-poly object to all target low-poly objects in the list",
         default=False
+    )
+
+    # Selected to Active settings
+    use_cage: bpy.props.BoolProperty(
+        name="Use Cage",
+        description="Use cage object for baking",
+        default=False
+    )
+    cage_object: PointerProperty(
+        name="Cage Object",
+        type=bpy.types.Object,
+        description="Cage object for baking"
+    )
+    extrusion: bpy.props.FloatProperty(
+        name="Extrusion",
+        description="Extrusion distance for rays",
+        default=0.5,
+        min=0.0,
+        max=10.0
+    )
+    max_ray_distance: bpy.props.FloatProperty(
+        name="Max Ray Distance",
+        description="Maximum ray distance for baking",
+        default=0.1,
+        min=0.0,
+        max=1.0
     )
 
 class BakeSettings(PropertyGroup):
@@ -79,30 +114,292 @@ class BakeSettings(PropertyGroup):
         default=False
     )
 
-def register_props():
-    bpy.types.Scene.bb_show_bake_objects = bpy.props.BoolProperty(
-        name="Bake Objects",
-        description="Show Bake Objects settings",
-        default=False,
+class OutputSettings(PropertyGroup):
+    """Output settings for baking resolution and format"""
+    # Bake resolution (high-res for baking)
+    bake_width: bpy.props.IntProperty(
+        name="Bake Width",
+        description="Width for baking resolution",
+        default=1024,
+        min=256,
+        max=8192
     )
-    bpy.types.Scene.bb_show_bake_settings = bpy.props.BoolProperty(
-        name="Bake Settings",
-        description="Show Bake Settings",
-        default=False,
-    )
-    bpy.types.Scene.bb_show_bake_panel = bpy.props.BoolProperty(
-        name="Bake",
-        description="Show Bake panel",
-        default=False,
+    bake_height: bpy.props.IntProperty(
+        name="Bake Height",
+        description="Height for baking resolution",
+        default=1024,
+        min=256,
+        max=8192
     )
 
-def unregister_props():
-    if hasattr(bpy.types.Scene, "bb_show_bake_objects"):
-        del bpy.types.Scene.bb_show_bake_objects
-    if hasattr(bpy.types.Scene, "bb_show_bake_settings"):
-        del bpy.types.Scene.bb_show_bake_settings
-    if hasattr(bpy.types.Scene, "bb_show_bake_panel"):
-        del bpy.types.Scene.bb_show_bake_panel
+    # Output resolution (final texture size)
+    output_width: bpy.props.IntProperty(
+        name="Output Width",
+        description="Final output texture width",
+        default=1024,
+        min=256,
+        max=8192
+    )
+    output_height: bpy.props.IntProperty(
+        name="Output Height",
+        description="Final output texture height",
+        default=1024,
+        min=256,
+        max=8192
+    )
+
+    # Margin settings
+    bake_margin: bpy.props.IntProperty(
+        name="Bake Margin",
+        description="Margin in pixels for baking",
+        default=16,
+        min=0,
+        max=64
+    )
+
+    margin_type: bpy.props.EnumProperty(
+        name="Margin Type",
+        items=[
+            ('ADJACENT_FACES', 'Adjacent Faces', 'Extend bake margin over adjacent faces'),
+            ('EXTEND', 'Extend', 'Extend bake beyond object bounds'),
+        ],
+        default='ADJACENT_FACES'
+    )
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def ensure_uv_map(obj, uv_name="Bake"):
+    """Ensure object has UV map with specified name"""
+    if obj.type != 'MESH':
+        return None
+
+    mesh = obj.data
+    uv_maps = mesh.uv_layers
+
+    # Check if UV map already exists
+    if uv_name in uv_maps:
+        return uv_maps[uv_name]
+
+    # Create new UV map
+    return uv_maps.new(name=uv_name)
+
+def create_bake_image(material_name, suffix, resolution=1024):
+    """Create new image for baking with proper naming"""
+    image_name = f"{material_name}_{suffix}"
+    image = bpy.data.images.new(
+        name=image_name,
+        width=resolution,
+        height=resolution,
+        alpha=(suffix in ['Normal', 'Alpha'])
+    )
+    return image
+
+def setup_material_for_baking(material, bake_image):
+    """Set up material nodes for baking - NON-DESTRUCTIVE"""
+    if not material:
+        return None
+
+    # Get or create node tree
+    if not material.node_tree:
+        return None
+
+    nodes = material.node_tree.nodes
+
+    # Find existing output node
+    output_node = None
+    for node in nodes:
+        if node.type == 'OUTPUT_MATERIAL':
+            output_node = node
+            break
+
+    if not output_node:
+        return None
+
+    # Create image texture node for baking (unconnected)
+    tex_node = nodes.new(type='ShaderNodeTexImage')
+    tex_node.location = (-600, -300)  # Position below main material
+    tex_node.image = bake_image
+    tex_node.label = f"Baked {bake_image.name.split('_')[-1]}"
+
+    # Don't connect to anything - keep it unconnected as requested
+    # The bake operation will use this node as the bake target
+
+    return tex_node
+
+def get_bake_type_mapping():
+    """Get mapping of bake type checkboxes to Blender bake types and suffixes"""
+    return {
+        'bake_diffuse': ('DIFFUSE', 'Albedo'),
+        'bake_normal': ('NORMAL', 'Normal'),
+        'bake_roughness_glossy': ('ROUGHNESS', 'Roughness'),
+        'bake_emit': ('EMIT', 'Emission'),
+        'bake_ao': ('AO', 'AmbientOcclusion'),
+        'bake_shadow': ('SHADOW', 'Shadow'),
+        'bake_uv': ('UV', 'UV'),
+        'bake_environment': ('ENVIRONMENT', 'Environment'),
+        'bake_glossy': ('GLOSSY', 'Glossy'),
+        'bake_transmission': ('TRANSMISSION', 'Transmission'),
+        'bake_sss': ('SUBSURFACE', 'SSS'),
+        'bake_sss_colour': ('SUBSURFACE_COLOR', 'SSSColor'),
+        'bake_metalness': ('METALNESS', 'Metalness'),
+        'bake_specular': ('SPECULAR', 'Specular'),
+        'bake_alpha': ('ALPHA', 'Alpha'),
+        'bake_clearcoat': ('CLEARCOAT', 'Clearcoat'),
+        'bake_clearcoat_roughness': ('CLEARCOAT_ROUGHNESS', 'ClearcoatRoughness'),
+        'bake_transmission_rough': ('TRANSMISSION_ROUGHNESS', 'TransmissionRoughness'),
+        'bake_emission_strength': ('EMISSION_STRENGTH', 'EmissionStrength'),
+        'bake_bump': ('BUMP', 'Bump'),
+    }
+
+def check_uv_maps_for_objects(bake_objects, require_bake_uv=True):
+    """Check if all objects have required UV maps"""
+    if not require_bake_uv:
+        return True, []
+
+    missing_uv_objects = []
+
+    for item in bake_objects.objects:
+        obj = item.object
+        if not obj or obj.type != 'MESH':
+            continue
+
+        # Check if "Bake" UV map exists
+        if "Bake" not in obj.data.uv_layers:
+            missing_uv_objects.append(obj.name)
+
+    return len(missing_uv_objects) == 0, missing_uv_objects
+
+# ============================================================================
+# CLEAN BAKE OPERATIONS (No more ugly elif chain!)
+# ============================================================================
+
+BAKE_OPERATIONS = {
+    'NORMAL': lambda: bpy.ops.object.bake(type='NORMAL', pass_filter={'COLOR'}),
+    'ROUGHNESS': lambda: bpy.ops.object.bake(type='ROUGHNESS', pass_filter={'COLOR'}),
+    'EMIT': lambda: bpy.ops.object.bake(type='EMIT', pass_filter={'COLOR'}),
+    'AO': lambda: bpy.ops.object.bake(type='AO', pass_filter={'COLOR'}),
+    'SHADOW': lambda: bpy.ops.object.bake(type='SHADOW', pass_filter={'COLOR'}),
+    'UV': lambda: bpy.ops.object.bake(type='UV', pass_filter={'COLOR'}),
+    'ENVIRONMENT': lambda: bpy.ops.object.bake(type='ENVIRONMENT', pass_filter={'COLOR'}),
+    'GLOSSY': lambda: bpy.ops.object.bake(type='GLOSSY', pass_filter={'COLOR'}),
+    'TRANSMISSION': lambda: bpy.ops.object.bake(type='TRANSMISSION', pass_filter={'COLOR'}),
+    'DIFFUSE': lambda: bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'}),
+    'SUBSURFACE': lambda: bpy.ops.object.bake(type='SUBSURFACE', pass_filter={'COLOR'}),
+    'SUBSURFACE_COLOR': lambda: bpy.ops.object.bake(type='SUBSURFACE_COLOR', pass_filter={'COLOR'}),
+    'METALNESS': lambda: bpy.ops.object.bake(type='METALNESS', pass_filter={'COLOR'}),
+    'SPECULAR': lambda: bpy.ops.object.bake(type='SPECULAR', pass_filter={'COLOR'}),
+    'ALPHA': lambda: bpy.ops.object.bake(type='ALPHA', pass_filter={'COLOR'}),
+    'CLEARCOAT': lambda: bpy.ops.object.bake(type='CLEARCOAT', pass_filter={'COLOR'}),
+    'CLEARCOAT_ROUGHNESS': lambda: bpy.ops.object.bake(type='CLEARCOAT_ROUGHNESS', pass_filter={'COLOR'}),
+    'TRANSMISSION_ROUGHNESS': lambda: bpy.ops.object.bake(type='TRANSMISSION_ROUGHNESS', pass_filter={'COLOR'}),
+    'EMISSION_STRENGTH': lambda: bpy.ops.object.bake(type='EMISSION_STRENGTH', pass_filter={'COLOR'}),
+    'BUMP': lambda: bpy.ops.object.bake(type='BUMP', pass_filter={'COLOR'}),
+}
+
+def perform_bake_operation(bake_type):
+    """Perform bake operation using clean dictionary lookup"""
+    if bake_type in BAKE_OPERATIONS:
+        return BAKE_OPERATIONS[bake_type]()
+    else:
+        raise ValueError(f"Unsupported bake type: {bake_type}")
+
+# ============================================================================
+# BAKING ENGINE
+# ============================================================================
+
+def perform_multi_baking(context, obj, bake_settings, output_settings):
+    """Perform baking for multiple selected bake types - REFACTORED"""
+    scene = context.scene
+
+    # Set bake resolution from output settings
+    bake_width = output_settings.bake_width
+    bake_height = output_settings.bake_height
+
+    # Set margin settings
+    scene.render.bake.margin = output_settings.bake_margin
+    scene.render.bake.margin_type = output_settings.margin_type
+
+    # Ensure UV map exists
+    if bake_settings.auto_uv_bake_map:
+        uv_map = ensure_uv_map(obj, "Bake")
+        if not uv_map:
+            return False, f"Failed to create UV map for {obj.name}"
+    else:
+        # Use first available UV map
+        if obj.data.uv_layers:
+            uv_map = obj.data.uv_layers[0]
+        else:
+            return False, f"No UV maps found for {obj.name}"
+
+    # Make UV map active
+    if obj.data.uv_layers:
+        for i, uv_layer in enumerate(obj.data.uv_layers):
+            uv_layer.active = (uv_layer == uv_map)
+
+    # Get bake type mapping
+    bake_mapping = get_bake_type_mapping()
+
+    # Get selected bake types
+    selected_bakes = []
+    for attr_name, (bake_type, suffix) in bake_mapping.items():
+        if getattr(bake_settings, attr_name, False):
+            selected_bakes.append((bake_type, suffix))
+
+    if not selected_bakes:
+        return False, f"No bake types selected for {obj.name}"
+
+    # Process each material
+    for slot in obj.material_slots:
+        material = slot.material
+        if not material:
+            continue
+
+        # Bake each selected type using clean dictionary approach
+        for bake_type, suffix in selected_bakes:
+            # Create bake image with proper suffix and resolution
+            image = create_bake_image(material.name, suffix, resolution=bake_width)
+
+            # Set up material for baking
+            tex_node = setup_material_for_baking(material, image)
+            if not tex_node:
+                continue
+
+            # Select object
+            bpy.ops.object.select_all(action='DESELECT')
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+            # Set bake settings
+            scene.cycles.samples = 1
+            scene.render.bake.use_selected_to_active = False
+
+            try:
+                # Use clean dictionary-based bake operation
+                perform_bake_operation(bake_type)
+
+                # Resize to output resolution if different from bake resolution
+                if (output_settings.output_width != bake_width or
+                    output_settings.output_height != bake_height):
+                    image.scale(output_settings.output_width, output_settings.output_height)
+
+                # Save image
+                image.pack()
+                image.filepath = f"//{material.name}_{suffix}.png"
+                image.save()
+
+                print(f"Baked {bake_type} for {obj.name} -> {material.name} ({bake_width}x{bake_height})")
+
+            except Exception as e:
+                print(f"Failed to bake {bake_type} for {obj.name}: {str(e)}")
+                continue
+
+    return True, f"Successfully baked {len(selected_bakes)} types for {obj.name}"
+
+# ============================================================================
+# OPERATORS
+# ============================================================================
 
 class BAKINGBAKES_OT_AddObject(Operator):
     """Add selected object to bake list"""
@@ -172,233 +469,8 @@ class BAKINGBAKES_OT_RefreshObjects(Operator):
     bl_description = "Refresh the bake objects list"
 
     def execute(self, context):
-        # For now, just report success
         self.report({'INFO'}, "Bake objects list refreshed")
         return {'FINISHED'}
-
-def ensure_uv_map(obj, uv_name="Bake"):
-    """Ensure object has UV map with specified name"""
-    if obj.type != 'MESH':
-        return None
-
-    mesh = obj.data
-    uv_maps = mesh.uv_layers
-
-    # Check if UV map already exists
-    if uv_name in uv_maps:
-        return uv_maps[uv_name]
-
-    # Create new UV map
-    return uv_maps.new(name=uv_name)
-
-def create_bake_image(material_name, resolution=1024):
-    """Create new image for baking"""
-    image_name = f"{material_name}_Albedo"
-    image = bpy.data.images.new(
-        name=image_name,
-        width=resolution,
-        height=resolution,
-        alpha=False
-    )
-    return image
-
-def setup_material_for_baking(material, bake_image):
-    """Set up material nodes for diffuse baking - NON-DESTRUCTIVE"""
-    if not material:
-        return None
-
-    # Get or create node tree
-    if not material.node_tree:
-        return None
-
-    nodes = material.node_tree.nodes
-
-    # Find existing output node
-    output_node = None
-    for node in nodes:
-        if node.type == 'OUTPUT_MATERIAL':
-            output_node = node
-            break
-
-    if not output_node:
-        return None
-
-    # Create image texture node for baking (unconnected)
-    tex_node = nodes.new(type='ShaderNodeTexImage')
-    tex_node.location = (-600, -300)  # Position below main material
-    tex_node.image = bake_image
-    tex_node.label = "Baked Albedo"
-
-    # Don't connect to anything - keep it unconnected as requested
-    # The bake operation will use this node as the bake target
-
-    return tex_node
-
-def get_bake_type_mapping():
-    """Get mapping of bake type checkboxes to Blender bake types"""
-    return {
-        'bake_diffuse': ('DIFFUSE', 'Albedo'),
-        'bake_normal': ('NORMAL', 'Normal'),
-        'bake_roughness_glossy': ('ROUGHNESS', 'Roughness'),
-        'bake_emit': ('EMIT', 'Emission'),
-        'bake_ao': ('AO', 'AmbientOcclusion'),
-        'bake_shadow': ('SHADOW', 'Shadow'),
-        'bake_uv': ('UV', 'UV'),
-        'bake_environment': ('ENVIRONMENT', 'Environment'),
-        'bake_glossy': ('GLOSSY', 'Glossy'),
-        'bake_transmission': ('TRANSMISSION', 'Transmission'),
-        'bake_sss': ('SUBSURFACE', 'SSS'),
-        'bake_sss_colour': ('SUBSURFACE_COLOR', 'SSSColor'),
-        'bake_metalness': ('METALNESS', 'Metalness'),
-        'bake_specular': ('SPECULAR', 'Specular'),
-        'bake_alpha': ('ALPHA', 'Alpha'),
-        'bake_clearcoat': ('CLEARCOAT', 'Clearcoat'),
-        'bake_clearcoat_roughness': ('CLEARCOAT_ROUGHNESS', 'ClearcoatRoughness'),
-        'bake_transmission_rough': ('TRANSMISSION_ROUGHNESS', 'TransmissionRoughness'),
-        'bake_emission_strength': ('EMISSION_STRENGTH', 'EmissionStrength'),
-        'bake_bump': ('BUMP', 'Bump'),
-    }
-
-def check_uv_maps_for_objects(bake_objects, require_bake_uv=True):
-    """Check if all objects have required UV maps"""
-    if not require_bake_uv:
-        return True, []
-
-    missing_uv_objects = []
-
-    for item in bake_objects.objects:
-        obj = item.object
-        if not obj or obj.type != 'MESH':
-            continue
-
-        # Check if "Bake" UV map exists
-        if "Bake" not in obj.data.uv_layers:
-            missing_uv_objects.append(obj.name)
-
-    return len(missing_uv_objects) == 0, missing_uv_objects
-
-def perform_multi_baking(context, obj, bake_settings):
-    """Perform baking for multiple selected bake types"""
-    scene = context.scene
-
-    # Ensure UV map exists
-    if bake_settings.auto_uv_bake_map:
-        uv_map = ensure_uv_map(obj, "Bake")
-        if not uv_map:
-            return False, f"Failed to create UV map for {obj.name}"
-    else:
-        # Use first available UV map
-        if obj.data.uv_layers:
-            uv_map = obj.data.uv_layers[0]
-        else:
-            return False, f"No UV maps found for {obj.name}"
-
-    # Make UV map active
-    if obj.data.uv_layers:
-        for i, uv_layer in enumerate(obj.data.uv_layers):
-            uv_layer.active = (uv_layer == uv_map)
-
-    # Get bake type mapping
-    bake_mapping = get_bake_type_mapping()
-
-    # Get selected bake types
-    selected_bakes = []
-    for attr_name, (bake_type, suffix) in bake_mapping.items():
-        if getattr(bake_settings, attr_name, False):
-            selected_bakes.append((bake_type, suffix))
-
-    if not selected_bakes:
-        return False, f"No bake types selected for {obj.name}"
-
-    # Process each material
-    for slot in obj.material_slots:
-        material = slot.material
-        if not material:
-            continue
-
-        # Bake each selected type
-        for bake_type, suffix in selected_bakes:
-            # Create bake image with proper suffix
-            image_name = f"{material.name}_{suffix}"
-            image = bpy.data.images.new(
-                name=image_name,
-                width=1024,
-                height=1024,
-                alpha=(bake_type in ['NORMAL', 'ALPHA'])
-            )
-
-            # Set up material for baking
-            tex_node = setup_material_for_baking(material, image)
-            if not tex_node:
-                continue
-
-            # Select object
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True)
-            context.view_layer.objects.active = obj
-
-            # Set bake settings based on type
-            scene.cycles.samples = 1
-            scene.render.bake.use_selected_to_active = False
-
-            try:
-                # Perform bake based on type
-                if bake_type == 'NORMAL':
-                    bpy.ops.object.bake(type='NORMAL', pass_filter={'COLOR'})
-                elif bake_type == 'ROUGHNESS':
-                    bpy.ops.object.bake(type='ROUGHNESS', pass_filter={'COLOR'})
-                elif bake_type == 'EMIT':
-                    bpy.ops.object.bake(type='EMIT', pass_filter={'COLOR'})
-                elif bake_type == 'AO':
-                    bpy.ops.object.bake(type='AO', pass_filter={'COLOR'})
-                elif bake_type == 'SHADOW':
-                    bpy.ops.object.bake(type='SHADOW', pass_filter={'COLOR'})
-                elif bake_type == 'UV':
-                    bpy.ops.object.bake(type='UV', pass_filter={'COLOR'})
-                elif bake_type == 'ENVIRONMENT':
-                    bpy.ops.object.bake(type='ENVIRONMENT', pass_filter={'COLOR'})
-                elif bake_type == 'GLOSSY':
-                    bpy.ops.object.bake(type='GLOSSY', pass_filter={'COLOR'})
-                elif bake_type == 'TRANSMISSION':
-                    bpy.ops.object.bake(type='TRANSMISSION', pass_filter={'COLOR'})
-                elif bake_type == 'DIFFUSE':
-                    bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'})
-                elif bake_type == 'SUBSURFACE':
-                    bpy.ops.object.bake(type='SUBSURFACE', pass_filter={'COLOR'})
-                elif bake_type == 'SUBSURFACE_COLOR':
-                    bpy.ops.object.bake(type='SUBSURFACE_COLOR', pass_filter={'COLOR'})
-                elif bake_type == 'METALNESS':
-                    bpy.ops.object.bake(type='METALNESS', pass_filter={'COLOR'})
-                elif bake_type == 'SPECULAR':
-                    bpy.ops.object.bake(type='SPECULAR', pass_filter={'COLOR'})
-                elif bake_type == 'ALPHA':
-                    bpy.ops.object.bake(type='ALPHA', pass_filter={'COLOR'})
-                elif bake_type == 'CLEARCOAT':
-                    bpy.ops.object.bake(type='CLEARCOAT', pass_filter={'COLOR'})
-                elif bake_type == 'CLEARCOAT_ROUGHNESS':
-                    bpy.ops.object.bake(type='CLEARCOAT_ROUGHNESS', pass_filter={'COLOR'})
-                elif bake_type == 'TRANSMISSION_ROUGHNESS':
-                    bpy.ops.object.bake(type='TRANSMISSION_ROUGHNESS', pass_filter={'COLOR'})
-                elif bake_type == 'EMISSION_STRENGTH':
-                    bpy.ops.object.bake(type='EMISSION_STRENGTH', pass_filter={'COLOR'})
-                elif bake_type == 'BUMP':
-                    bpy.ops.object.bake(type='BUMP', pass_filter={'COLOR'})
-                else:
-                    print(f"Unsupported bake type: {bake_type}")
-                    continue
-
-                # Save image
-                image.pack()
-                image.filepath = f"//{image_name}.png"
-                image.save()
-
-                print(f"Baked {bake_type} for {obj.name} -> {material.name}")
-
-            except Exception as e:
-                print(f"Failed to bake {bake_type} for {obj.name}: {str(e)}")
-                continue
-
-    return True, f"Successfully baked {len(selected_bakes)} types for {obj.name}"
 
 class BAKINGBAKES_OT_BakeObjects(Operator):
     """Bake all objects in the list"""
@@ -410,10 +482,122 @@ class BAKINGBAKES_OT_BakeObjects(Operator):
         scene = context.scene
         bake_objects = scene.bakingbakes_objects
         bake_settings = scene.bakingbakes_settings
+        output_settings = scene.bakingbakes_output
 
         if not bake_objects.objects:
             self.report({'WARNING'}, "No objects in bake list")
             return {'CANCELLED'}
+
+        # Check bake mode
+        if bake_objects.bake_selected_to_targets:
+            # SELECTED-TO-ACTIVE MODE: High-poly source to low-poly targets
+            return self._bake_selected_to_active(context, bake_objects, bake_settings, output_settings)
+        else:
+            # NORMAL MODE: Bake each object individually
+            return self._bake_individual_objects(context, bake_objects, bake_settings, output_settings)
+
+    def _bake_selected_to_active(self, context, bake_objects, bake_settings, output_settings):
+        """Bake from selected high-poly object to target low-poly objects"""
+        scene = context.scene
+
+        # Get currently selected object (this is the SOURCE/high-poly)
+        selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objects:
+            self.report({'ERROR'}, "No source object selected. Select high-poly object and try again.")
+            return {'CANCELLED'}
+
+        source_object = selected_objects[0]  # Use first selected object as source
+
+        # Check that we have target objects in the bake list
+        target_objects = [item.object for item in bake_objects.objects if item.object and item.object != source_object]
+        if not target_objects:
+            self.report({'ERROR'}, "No target objects in bake list. Add low-poly objects to bake list.")
+            return {'CANCELLED'}
+
+        # Set up baking settings
+        scene.render.bake.margin = output_settings.bake_margin
+        scene.render.bake.margin_type = output_settings.margin_type
+
+        # Get selected bake types
+        bake_mapping = get_bake_type_mapping()
+        selected_bakes = []
+        for attr_name, (bake_type, suffix) in bake_mapping.items():
+            if getattr(bake_settings, attr_name, False):
+                selected_bakes.append((bake_type, suffix))
+
+        if not selected_bakes:
+            self.report({'WARNING'}, "No bake types selected")
+            return {'CANCELLED'}
+
+        success_count = 0
+        total_bakes = 0
+
+        # Bake each target object from the source
+        for target_obj in target_objects:
+            if not target_obj:
+                continue
+
+            # Process each material on target
+            for slot in target_obj.material_slots:
+                material = slot.material
+                if not material:
+                    continue
+
+                # Bake each selected type from source to target
+                for bake_type, suffix in selected_bakes:
+                    # Create bake image
+                    image = create_bake_image(material.name, suffix, resolution=output_settings.bake_width)
+
+                    # Set up material for baking
+                    tex_node = setup_material_for_baking(material, image)
+                    if not tex_node:
+                        continue
+
+                    # Set up source and target for selected-to-active baking
+                    bpy.ops.object.select_all(action='DESELECT')
+
+                    # Select SOURCE first, then TARGET
+                    source_object.select_set(True)
+                    target_obj.select_set(True)
+                    context.view_layer.objects.active = target_obj  # Target becomes active
+
+                    # Set selected-to-active baking mode
+                    scene.render.bake.use_selected_to_active = True
+                    scene.render.bake.cage_extrusion = bake_objects.extrusion
+                    scene.render.bake.max_ray_distance = bake_objects.max_ray_distance
+
+                    if bake_objects.use_cage and bake_objects.cage_object:
+                        scene.render.bake.cage_object = bake_objects.cage_object.name
+
+                    try:
+                        # Perform bake operation
+                        perform_bake_operation(bake_type)
+
+                        # Resize to output resolution if needed
+                        if (output_settings.output_width != output_settings.bake_width or
+                            output_settings.output_height != output_settings.bake_height):
+                            image.scale(output_settings.output_width, output_settings.output_height)
+
+                        # Save image
+                        image.pack()
+                        image.filepath = f"//{material.name}_{suffix}.png"
+                        image.save()
+
+                        print(f"Baked {bake_type} from {source_object.name} to {target_obj.name}")
+                        success_count += 1
+
+                    except Exception as e:
+                        print(f"Failed to bake {bake_type} from {source_object.name} to {target_obj.name}: {str(e)}")
+                        continue
+
+        self.report({'INFO'}, f"Successfully baked from {source_object.name} to {len(target_objects)} targets ({success_count} total maps)")
+        return {'FINISHED'}
+
+    def _bake_individual_objects(self, context, bake_objects, bake_settings, output_settings):
+        """Bake each object individually (original mode)"""
+        success_count = 0
+        failed_objects = []
+        total_bakes = 0
 
         # Check UV maps if required
         if bake_settings.auto_uv_bake_map:
@@ -423,29 +607,22 @@ class BAKINGBAKES_OT_BakeObjects(Operator):
                 self.report({'ERROR'}, f"Bake UV map not found in objects: {missing_list}")
                 return {'CANCELLED'}
 
-        # Multi-bake mode - bake all selected types for each object
-        success_count = 0
-        failed_objects = []
-        total_bakes = 0
-
         for item in bake_objects.objects:
             obj = item.object
             if not obj:
                 continue
 
-            success, message = perform_multi_baking(context, obj, bake_settings)
+            success, message = perform_multi_baking(context, obj, bake_settings, output_settings)
             if success:
                 success_count += 1
-                # Extract number of baked types from message
                 try:
-                    baked_count = int(message.split()[-2])  # "Successfully baked X types"
+                    baked_count = int(message.split()[-2])
                     total_bakes += baked_count
                 except:
                     total_bakes += 1
             else:
                 failed_objects.append(f"{obj.name}: {message}")
 
-        # Report results
         if success_count > 0:
             self.report({'INFO'}, f"Successfully baked {success_count} objects ({total_bakes} total maps)")
             if failed_objects:
@@ -455,6 +632,10 @@ class BAKINGBAKES_OT_BakeObjects(Operator):
             return {'CANCELLED'}
 
         return {'FINISHED'}
+
+# ============================================================================
+# UI COMPONENTS
+# ============================================================================
 
 class BAKINGBAKES_UL_ObjectsList(UIList):
     """UI List for bake objects"""
@@ -506,6 +687,20 @@ class BAKINGBAKES_PT_MainPanel(Panel):
 
             # Bake Selected to Target Objects checkbox
             box.prop(bake_objects, "bake_selected_to_targets", text="Bake Selected Object to Target Objects")
+
+            # Selected to Active settings subpanel
+            if bake_objects.bake_selected_to_targets:
+                sub_box = box.box()
+                sub_box.label(text="Selected to Active Settings:")
+
+                # Cage settings
+                sub_box.prop(bake_objects, "use_cage", text="Use Cage")
+                if bake_objects.use_cage:
+                    sub_box.prop(bake_objects, "cage_object", text="Cage Object")
+
+                # Ray settings
+                sub_box.prop(bake_objects, "extrusion", text="Extrusion")
+                sub_box.prop(bake_objects, "max_ray_distance", text="Max Ray Distance")
 
             # Show count
             if bake_objects.objects:
@@ -567,6 +762,31 @@ class BAKINGBAKES_PT_MainPanel(Panel):
             ])
             box.label(text=f"Selected: {selected_types} bake types")
 
+        # Output Settings toggle section (NEW!)
+        icon = 'TRIA_DOWN' if scene.bb_show_output_settings else 'TRIA_RIGHT'
+        layout.prop(scene, "bb_show_output_settings", text="Output Settings", icon=icon, toggle=True)
+
+        if scene.bb_show_output_settings:
+            box = layout.box()
+            output_settings = scene.bakingbakes_output
+
+            # Bake resolution settings
+            box.label(text="Bake at:")
+            row = box.row()
+            row.prop(output_settings, "bake_width", text="Bake Width")
+            row.prop(output_settings, "bake_height", text="Bake Height")
+
+            # Output resolution settings
+            box.label(text="Output at:")
+            row = box.row()
+            row.prop(output_settings, "output_width", text="Output Width")
+            row.prop(output_settings, "output_height", text="Output Height")
+
+            # Margin settings
+            box.label(text="Margin Type:")
+            box.prop(output_settings, "margin_type", text="")
+            box.prop(output_settings, "bake_margin", text="Bake Margin")
+
         # Bake toggle section
         icon = 'TRIA_DOWN' if scene.bb_show_bake_panel else 'TRIA_RIGHT'
         layout.prop(scene, "bb_show_bake_panel", text="Bake", icon=icon, toggle=True)
@@ -579,35 +799,84 @@ class BAKINGBAKES_PT_MainPanel(Panel):
             bake_row.scale_y = 2.0
             bake_row.operator("bakingbakes.bake_objects", text="BAKE OBJECTS")
 
+# ============================================================================
+# REGISTRATION
+# ============================================================================
+
+def register_props():
+    """Register scene properties"""
+    bpy.types.Scene.bb_show_bake_objects = bpy.props.BoolProperty(
+        name="Bake Objects",
+        description="Show Bake Objects settings",
+        default=False,
+    )
+    bpy.types.Scene.bb_show_bake_settings = bpy.props.BoolProperty(
+        name="Bake Settings",
+        description="Show Bake Settings",
+        default=False,
+    )
+    bpy.types.Scene.bb_show_output_settings = bpy.props.BoolProperty(
+        name="Output Settings",
+        description="Show Output Settings",
+        default=False,
+    )
+    bpy.types.Scene.bb_show_bake_panel = bpy.props.BoolProperty(
+        name="Bake",
+        description="Show Bake panel",
+        default=False,
+    )
+
+def unregister_props():
+    """Unregister scene properties"""
+    if hasattr(bpy.types.Scene, "bb_show_bake_objects"):
+        del bpy.types.Scene.bb_show_bake_objects
+    if hasattr(bpy.types.Scene, "bb_show_bake_settings"):
+        del bpy.types.Scene.bb_show_bake_settings
+    if hasattr(bpy.types.Scene, "bb_show_output_settings"):
+        del bpy.types.Scene.bb_show_output_settings
+    if hasattr(bpy.types.Scene, "bb_show_bake_panel"):
+        del bpy.types.Scene.bb_show_bake_panel
+
 def register():
+    """Register all addon components"""
     # Register properties first
     register_props()
 
-    # Register classes in order
+    # Register classes in dependency order
     bpy.utils.register_class(BakeObjectItem)
     bpy.utils.register_class(BakeObjectsList)
     bpy.utils.register_class(BakeSettings)
+    bpy.utils.register_class(OutputSettings)
+
+    # Register operators
     bpy.utils.register_class(BAKINGBAKES_OT_AddObject)
     bpy.utils.register_class(BAKINGBAKES_OT_RemoveObject)
     bpy.utils.register_class(BAKINGBAKES_OT_ClearObjects)
     bpy.utils.register_class(BAKINGBAKES_OT_RefreshObjects)
     bpy.utils.register_class(BAKINGBAKES_OT_BakeObjects)
+
+    # Register UI components
     bpy.utils.register_class(BAKINGBAKES_UL_ObjectsList)
     bpy.utils.register_class(BAKINGBAKES_PT_MainPanel)
 
     # Add properties to Scene
     bpy.types.Scene.bakingbakes_objects = PointerProperty(type=BakeObjectsList)
     bpy.types.Scene.bakingbakes_settings = PointerProperty(type=BakeSettings)
+    bpy.types.Scene.bakingbakes_output = PointerProperty(type=OutputSettings)
 
 def unregister():
+    """Unregister all addon components"""
     # Unregister in reverse order
     bpy.utils.unregister_class(BAKINGBAKES_PT_MainPanel)
     bpy.utils.unregister_class(BAKINGBAKES_UL_ObjectsList)
+
     bpy.utils.unregister_class(BAKINGBAKES_OT_BakeObjects)
     bpy.utils.unregister_class(BAKINGBAKES_OT_RefreshObjects)
     bpy.utils.unregister_class(BAKINGBAKES_OT_ClearObjects)
     bpy.utils.unregister_class(BAKINGBAKES_OT_RemoveObject)
     bpy.utils.unregister_class(BAKINGBAKES_OT_AddObject)
+
+    bpy.utils.unregister_class(OutputSettings)
     bpy.utils.unregister_class(BakeSettings)
     bpy.utils.unregister_class(BakeObjectsList)
     bpy.utils.unregister_class(BakeObjectItem)
@@ -617,6 +886,8 @@ def unregister():
         del bpy.types.Scene.bakingbakes_objects
     if hasattr(bpy.types.Scene, "bakingbakes_settings"):
         del bpy.types.Scene.bakingbakes_settings
+    if hasattr(bpy.types.Scene, "bakingbakes_output"):
+        del bpy.types.Scene.bakingbakes_output
 
     # Unregister properties
     unregister_props()
