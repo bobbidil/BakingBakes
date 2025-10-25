@@ -68,7 +68,7 @@ def get_bake_type_mapping():
         'bake_diffuse': ('DIFFUSE', 'Albedo'),
         'bake_normal': ('NORMAL', 'Normal'),
         'bake_roughness_glossy': ('ROUGHNESS', 'Roughness'),
-        'bake_emit': ('EMIT', 'Emission'),
+        'bake_emission': ('EMIT', 'Emission'),
         'bake_ao': ('AO', 'AmbientOcclusion'),
         'bake_shadow': ('SHADOW', 'Shadow'),
         'bake_uv': ('UV', 'UV'),
