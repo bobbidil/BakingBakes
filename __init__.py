@@ -1,8 +1,3 @@
-"""
-BakingBakes Addon - Clean, Refactored Single File
-No more ugly elif chains or monolithic code!
-"""
-
 bl_info = {
     "name": "BakingBakes",
     "author": "Bob Tabbington",
@@ -12,8 +7,17 @@ bl_info = {
     "description": "Multi-object baking management",
     "warning": "This addon may require comprehensive understanding of baking techniques",
     "doc_url": "",
-    "category": "Render",
+    "category": "Testing",
 }
+
+# __init__.py
+if "loaded" in locals():
+    import importlib
+    importlib.reload(ops)
+    importlib.reload(ui)
+else:
+    from . import ops, ui
+loaded = True
 
 import bpy
 from bpy.props import CollectionProperty, PointerProperty
