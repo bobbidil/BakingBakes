@@ -28,7 +28,7 @@ class BAKINGBAKES_PT_MainPanel(Panel):
         scene = context.scene
 
         # Header
-        layout.label(text="BakingBakes", icon='RENDER_RESULT')
+        layout.label(text="BakingBakes", icon='SHADING_SOLID'')
 
         # Bake Objects toggle section
         icon = 'TRIA_DOWN' if scene.bb_show_bake_objects else 'TRIA_RIGHT'
